@@ -1,0 +1,79 @@
+name: Build ymor APK
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      # Pakai keystore tetap kalau secret KEYSTORE_BASE64 diisi (update APK bisa menimpa versi lama).
+      # Kalau tidak ada, dibuat keystore sementara: APK tetap terpasang, tapi tidak bisa di-update
+      # dari build berikutnya (harus uninstall dulu).
+      - name: Siapkan keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          SECRET_STORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          SECRET_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          SECRET_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ks="$RUNNER_TEMP/ymor.jks"
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$ks"
+            store_pass="$SECRET_STORE_PASS"; alias="$SECRET_KEY_ALIAS"; key_pass="$SECRET_KEY_PASS"
+          else
+            echo "::warning::KEYSTORE_BASE64 kosong, memakai keystore sementara."
+            store_pass="ymor-temp-pass"; alias="ymor"; key_pass="ymor-temp-pass"
+            keytool -genkeypair -keystore "$ks" -storepass "$store_pass" -keypass "$key_pass" \
+              -alias "$alias" -keyalg RSA -keysize 4096 -validity 10000 -dname "CN=ymor"
+          fi
+          {
+            echo "KEYSTORE_PATH=$ks"
+            echo "KEYSTORE_PASSWORD=$store_pass"
+            echo "KEY_ALIAS=$alias"
+            echo "KEY_PASSWORD=$key_pass"
+          } >> "$GITHUB_ENV"
+
+      - name: Build release APK
+        run: |
+          ./gradlew :androidApp:assembleRelease --no-daemon --no-configuration-cache \
+            -x :androidApp:lintVitalRelease
+
+      - name: Kumpulkan APK
+        run: |
+          mkdir -p dist
+          find androidApp/build/outputs/apk/release -name "*.apk" -exec cp {} dist/ \;
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ymor-apk
+          path: dist/*.apk
+
+      - name: Rilis di GitHub (hanya saat push tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.apk
